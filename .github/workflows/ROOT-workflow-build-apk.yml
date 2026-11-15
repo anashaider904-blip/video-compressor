@@ -1,0 +1,174 @@
+name: Build Video Compressor APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Unzip project
+        run: mkdir -p project && unzip -o video-compressor.zip -d project
+      - name: Decode signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          cd project
+          echo "$KEYSTORE_BASE64" | base64 -d > "$PWD/video-compressor-release.p12"
+          ls -la video-compressor-release.p12
+      - name: Build APK
+        env:
+          KEYSTORE_PASSWORD: "da6b9f7a6bdc36d6319034231ec2faec"
+          KEY_PASSWORD: "da6b9f7a6bdc36d6319034231ec2faec"
+        run: |
+          set -e
+          cd project
+          if [ ! -d android ]; then flutter create . --project-name videocompressor; fi
+          python3 << 'PYEOF2'
+          import pathlib
+          p = pathlib.Path('android/app/src/main/AndroidManifest.xml')
+          s = p.read_text()
+          perms = [
+              'android.permission.INTERNET',
+          ]
+          changed = False
+          for perm in perms:
+              if perm not in s:
+                  s = s.replace('<application', '<uses-permission android:name="' + perm + '"/>\n    <application', 1)
+                  changed = True
+          impeller_meta = '<meta-data android:name="io.flutter.embedding.android.EnableImpeller" android:value="false"/>'
+          if 'EnableImpeller' not in s:
+              s = s.replace('</application>', '    ' + impeller_meta + '\n    </application>', 1)
+              changed = True
+          if changed:
+              p.write_text(s)
+          print(p.read_text())
+          PYEOF2
+          python3 << 'PYEOF2'
+          import pathlib, re
+          app_dir = pathlib.Path('android/app')
+          gradle = app_dir / 'build.gradle.kts'
+          if not gradle.exists():
+              gradle = app_dir / 'build.gradle'
+          s = gradle.read_text()
+          if 'com.example.videocompressor' in s:
+              s = s.replace('com.example.videocompressor', 'com.videocompressorbyanas.app')
+          if 'minSdk = flutter.minSdkVersion' in s:
+              s = s.replace('minSdk = flutter.minSdkVersion', 'minSdk = 24')
+          elif 'minSdkVersion flutter.minSdkVersion' in s:
+              s = s.replace('minSdkVersion flutter.minSdkVersion', 'minSdkVersion 24')
+          if 'abiFilters' not in s and 'defaultConfig {' in s:
+              s = s.replace('defaultConfig {', 'defaultConfig {\n        ndk { abiFilters += listOf("arm64-v8a") }', 1)
+          gradle.write_text(s)
+          print('gradle patched:', gradle)
+          main = None
+          for cand in (app_dir / 'src/main').rglob('MainActivity.kt'):
+              main = cand
+              break
+          if main is not None:
+              code = main.read_text()
+              code = re.sub(r'(?m)^package\s+\S+', 'package com.videocompressorbyanas.app', code, count=1)
+              dest = app_dir / 'src/main/kotlin/com/videocompressorbyanas/app/MainActivity.kt'
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              if main.resolve() != dest.resolve():
+                  dest.write_text(code)
+                  main.unlink()
+                  print('MainActivity.kt moved:', main, '->', dest)
+                  d = main.parent
+                  while d != (app_dir / 'src/main') and d.exists() and not any(d.iterdir()):
+                      d.rmdir()
+                      d = d.parent
+              else:
+                  dest.write_text(code)
+                  print('MainActivity.kt package updated in place:', dest)
+          else:
+              print('WARNING: MainActivity.kt not found')
+          PYEOF2
+          cp -r launcher_icons/mipmap-mdpi launcher_icons/mipmap-hdpi launcher_icons/mipmap-xhdpi launcher_icons/mipmap-xxhdpi launcher_icons/mipmap-xxxhdpi android/app/src/main/res/
+          rm -rf android/app/src/main/res/mipmap-anydpi-v26
+          cat > android/key.properties << KEYPROPS
+          storePassword=$KEYSTORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=videocompressor
+          storeFile=$PWD/video-compressor-release.p12
+          KEYPROPS
+          python3 << 'PYEOF2'
+          import pathlib, re
+          app_dir = pathlib.Path('android/app')
+          kts = app_dir / 'build.gradle.kts'
+          groovy = app_dir / 'build.gradle'
+          if kts.exists():
+              f, s = kts, kts.read_text()
+              loader = (
+                  'import java.util.Properties\n'
+                  'import java.io.FileInputStream\n\n'
+                  'val keyProperties = Properties()\n'
+                  'val keyPropertiesFile = rootProject.file("key.properties")\n'
+                  'if (keyPropertiesFile.exists()) {\n'
+                  '    keyProperties.load(FileInputStream(keyPropertiesFile))\n'
+                  '}\n\n'
+              )
+              if 'keyProperties' not in s:
+                  s = loader + s
+              block = (
+                  '    signingConfigs {\n'
+                  '        create("release") {\n'
+                  '            keyAlias = keyProperties["keyAlias"] as String\n'
+                  '            keyPassword = keyProperties["keyPassword"] as String\n'
+                  '            storeFile = file(keyProperties["storeFile"] as String)\n'
+                  '            storePassword = keyProperties["storePassword"] as String\n'
+                  '        }\n'
+                  '    }\n'
+              )
+              if 'create("release")' not in s:
+                  s = s.replace('buildTypes {', block + '    buildTypes {', 1)
+              if 'signingConfigs.getByName("debug")' in s:
+                  s = s.replace('signingConfigs.getByName("debug")', 'signingConfigs.getByName("release")')
+              elif 'getByName("release")' not in s:
+                  s = re.sub(r'(release\s*\{\n)', r'\1            signingConfig = signingConfigs.getByName("release")\n', s, count=1)
+              f.write_text(s)
+              print('Injected release signing into build.gradle.kts')
+          elif groovy.exists():
+              f, s = groovy, groovy.read_text()
+              loader = (
+                  'def keyProperties = new Properties()\n'
+                  'def keyPropertiesFile = rootProject.file("key.properties")\n'
+                  'if (keyPropertiesFile.exists()) {\n'
+                  '    keyProperties.load(new FileInputStream(keyPropertiesFile))\n'
+                  '}\n\n'
+              )
+              if 'keyProperties' not in s:
+                  s = loader + s
+              block = (
+                  '    signingConfigs {\n'
+                  '        release {\n'
+                  "            keyAlias keyProperties['keyAlias']\n"
+                  "            keyPassword keyProperties['keyPassword']\n"
+                  "            storeFile file(keyProperties['storeFile'])\n"
+                  "            storePassword keyProperties['storePassword']\n"
+                  '        }\n'
+                  '    }\n'
+              )
+              if 'signingConfigs' not in s:
+                  s = s.replace('buildTypes {', block + '    buildTypes {', 1)
+              if 'signingConfig signingConfigs.debug' in s:
+                  s = s.replace('signingConfig signingConfigs.debug', 'signingConfig signingConfigs.release')
+              elif 'signingConfigs.release' not in s.split('buildTypes {', 1)[-1]:
+                  s = re.sub(r'(release\s*\{\n)', r'\1            signingConfig signingConfigs.release\n', s, count=1)
+              f.write_text(s)
+              print('Injected release signing into build.gradle (Groovy)')
+          else:
+              raise SystemExit('No gradle build file found under android/app')
+          print(f.read_text())
+          PYEOF2
+          flutter pub get
+          flutter build apk --release --target-platform android-arm64
+          ($JAVA_HOME/bin/keytool -printcert -jarfile build/app/outputs/flutter-apk/app-release.apk || true)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: video-compressor-apk
+          path: project/build/app/outputs/flutter-apk/app-release.apk
